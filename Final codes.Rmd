@@ -1,0 +1,278 @@
+---
+title: "Final Code"
+author: "Group I"
+date: "2024-12-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Arctic Tern Projet
+
+##Load packages
+
+First, let's load in the packages 'tidyverse', 'weathercan', 'lme4', and 'lmerTest' for data wrangling and plotting, weather data, linear mixed models, and p-values respectively. *Warning*: please be careful about the dates, because you might get errors when using date functions?
+
+```{r}
+library(tidyverse)
+library(weathercan)
+library(lme4)
+library(lmerTest)
+```
+
+##Load in bird dataset
+
+Next we will load in and clean the bird dataset that we will use that was downloaded from NatureCounts/eBird. Make sure you download "ebird-ca-no_naturecounts_data.csv" from GitHub.
+
+```{r}
+#load in dataset
+bird_yukon <- read_csv("ebird-ca-no_naturecounts_data.csv") %>%
+  filter(StateProvince == "Yukon Territory")
+
+#let's check out the bird data.
+head(bird_yukon)
+
+#we want to add a date column and north/south column to split up the yukon observations into north and south yukon.
+bird_yukon$N_or_S <- case_when(bird_yukon$DecimalLatitude > 64.505 ~ "N", bird_yukon$DecimalLatitude <= 64.505 ~ "S")
+
+bird_yukon$Date <- as.Date(paste(bird_yukon$YearCollected, bird_yukon$MonthCollected, bird_yukon$DayCollected, sep="-"), "%Y-%m-%d")
+```
+
+##50% cutoff dates
+
+Next, we will calculate the 50% cutoff dates for each year for north and south Yukon which will determine the migration date.
+
+```{r}
+#create a new file called cutoffs_bird_yukon
+#first we will calculate the 50% cutoffs, then the dates.
+
+cutoffs_bird_yukon <- bird_yukon %>%
+  #select these columns to make it easier to work with
+  select(StateProvince, YearCollected, MonthCollected, DayCollected, ObservationCount, CommonName, Date, N_or_S) %>%
+  #we only want Yukon observations
+  filter (StateProvince == "Yukon Territory") %>%
+  #some observations do not have a bird count
+  filter(ObservationCount != "X") %>%
+  #we only want observations after 1994
+  filter(YearCollected >= 1994) %>%
+  group_by(YearCollected, N_or_S) %>%
+  #create a new column for the 50% cutoff amount, as well as the number of samples which will be used to control for sampling bias
+  summarize(Cutoff = 0.5*sum(as.numeric(ObservationCount)), Num_samples = n())
+
+#set a new blank column for cutoff date 
+cutoffs_bird_yukon$Date_of_cutoff <- as.Date(0)
+
+#now we will calculate the date at which 50% of birds have been observed. We will calculate one date for each row in cutoffs_bird_yukon
+
+for (i in 1:nrow(cutoffs_bird_yukon)){
+  #create a temporary dataset from bird_yukon that selects the year and north/south location and calculates the number of birds seen on each day.
+  data_temporary <- bird_yukon %>%
+    #remove observations that did not give number of birds
+    filter(ObservationCount != "X") %>%
+    #filter for yukon birds
+    filter(StateProvince == "Yukon Territory") %>%
+    #filter for the year and location (N/S) in the row we are in of cutoffs_bird_yukon
+    filter(YearCollected == cutoffs_bird_yukon$YearCollected[i] & N_or_S == cutoffs_bird_yukon$N_or_S[i]) %>%
+    group_by(Date) %>%
+    #calculate the total birds seen in a day
+    summarize(DailyTotal = sum(as.numeric(ObservationCount)))
+  
+  #then take the cumulative over the days in the year
+  data_temporary$cumulative <- ave(data_temporary$DailyTotal, FUN = cumsum)
+  
+  #set the date of cutoff to be the first day that passes the 50% cutoff.
+  day_of_cutoff <- subset(data_temporary, cumulative >= cutoffs_bird_yukon$Cutoff[i])$Date[1]
+  
+  #add this day into the column in cutoffs_bird_yukon
+  cutoffs_bird_yukon$Date_of_cutoff[i] <- day_of_cutoff
+}
+
+#The date is originally in a longer date format, so we can convert it to a julian date for later.
+cutoffs_bird_yukon$simple_date <- as.numeric(format(cutoffs_bird_yukon$Date_of_cutoff, "%j"))
+
+#let's inspect the data now. Looks great.
+head(cutoffs_bird_yukon)
+
+
+```
+
+##Temperature data
+
+To load in the weather data, we will use the 'weathercan' package. We will use data from Whitehorse Airport for the south and Inuvik (in NWT but close to the border) for northern Yukon. *Loading weather data may take a long time (many minutes)*
+
+```{r}
+#lets search for the stations
+stations_search("Whitehorse")
+stations_search("Inuvik")
+
+#download Whitehorse from Whitehorse A until Dec. 2012 and then after Dec. 2012. The data for this station ends here, but resumes in the same location under a different name 
+
+whitehorse_to_dec2012 <- weather_dl(station_ids = 1617, start = "1994-01-01", end = "2012-12-05", interval = "day")
+
+whitehorse_after_dec2012 <- weather_dl(station_ids = 50842, start = "2012-12-08", end = "2024-10-01", interval = "day")
+
+#download Inuvik data using the same strategy as above.
+
+Inuvik_pre_2005 <- weather_dl(station_ids = 1669, start = "1994-01-01", end = "2004-12-31", interval = "day")
+
+Inuvik_post_2005 <- weather_dl(station_ids = 41883, start = "2005-01-01", end = "2024-10-01", interval = "day")
+
+#now lets select the columns we like and filter to the migration season, and combine the datasets into a single one for each location
+
+#filter and select
+Filtered_Whitehorse_2012 <- whitehorse_to_dec2012 %>%
+  #select for the right columns
+  select(year, month, date, mean_temp, max_temp) %>%
+  #filter for when birds show up
+  filter(month >= "03" & month <= "08")
+
+Filtered_Whitehorse_2013 <- whitehorse_after_dec2012 %>%
+  #select for the right columns
+  select(year, month, date, mean_temp, max_temp) %>%
+  #filter for when birds show up
+  filter(month >= "03" & month <= "08")
+
+#combine the whitehorse data
+Filtered_Whitehorse <- bind_rows(Filtered_Whitehorse_2012, Filtered_Whitehorse_2013)
+
+#filter and select as above
+Filtered_Inuvik_2004 <- Inuvik_pre_2005 %>%
+  select(year, month, date, mean_temp, max_temp) %>%
+  filter(month >= "03" & month <= "08")
+
+Filtered_Inuvik_2005 <- Inuvik_post_2005 %>%
+  select(year, month, date, mean_temp, max_temp) %>%
+  filter(month >= "03" & month <= "08")
+
+#combine the Inuvik temperatures
+combined_data_Inuvik <- bind_rows(Filtered_Inuvik_2004, Filtered_Inuvik_2005)
+```
+
+##Calculate the temperature for each year, north/south in cutoffs_bird_yukon
+
+Now we will calculate the temperature of the migration season for each year in the north and south of Yukon. First, we will add a couple new columns to the datasets, then we will calculate the temperatures. 
+
+```{r}
+#first add a blank column for the temperatures to be added
+cutoffs_bird_yukon$temperature <- NA
+
+#add julian dates to the temperature data so it is easier to work with
+combined_data_Inuvik$julian_date <- as.numeric(format(combined_data_Inuvik$date, "%j"))
+
+Filtered_Whitehorse$julian_date <- as.numeric(format(Filtered_Whitehorse$date, "%j"))
+
+
+#now we will calculate the temperature in each year. 
+
+for (i in 1:nrow(cutoffs_bird_yukon)){
+  #calculate the temperature for each row in cutoffs_bird_yukon. If in the north, and the cutoff date is not missing, then use Inuvik date.
+  if (cutoffs_bird_yukon$N_or_S[i] == "N" & !is.na(cutoffs_bird_yukon$Cutoff[i])){
+    #set the temperature of the migration season to be the mean of all days during the main migration season (May to July) during that year, excluding days without temperature data
+    cutoffs_bird_yukon$temperature[i] <- 
+      mean(filter(combined_data_Inuvik, 
+                  as.numeric(year) == cutoffs_bird_yukon$YearCollected[i] & 
+                    as.numeric(month) >= 5 & 
+                    as.numeric(month) <= 7 &
+                    !is.na(mean_temp))$mean_temp)
+  }
+  #otherwise, if in the south, use Whitehorse data
+  else if (cutoffs_bird_yukon$N_or_S[i] == "S" & !is.na(cutoffs_bird_yukon$Cutoff[i])){
+    #set the temperature of the migration season to be the mean of all days during the main migration season (May to July) during that year, excluding days without temperature data
+    cutoffs_bird_yukon$temperature[i] <- 
+      mean(filter(Filtered_Whitehorse, 
+                  as.numeric(year) == cutoffs_bird_yukon$YearCollected[i] & 
+                    as.numeric(month) >= 5 & 
+                    as.numeric(month) <= 7  & 
+                    !is.na(mean_temp))$mean_temp)
+  }
+}
+```
+
+## Models and AIC scores
+
+Next we will calculate three models for migration date vs temperature. All will have a random effect of location of observation. One will have both temperature and observation count as fixed effects, one will have just temperature, and one will have just observation count. We will also look at the relationship between temperature and year to see if warming occurs.
+
+```{r}
+#model with both fixed effects
+model <- lmer(formula = simple_date ~ temperature + Num_samples + (1 + temperature + Num_samples|N_or_S), data = cutoffs_bird_yukon)
+
+#model with only temperature as a fixed effect
+model2 <- lmer(formula = simple_date ~ temperature + (1 + temperature|N_or_S), data = cutoffs_bird_yukon)
+
+#model with only observation count as a fixed effect
+model3 <- lmer(formula = simple_date ~ Num_samples + (1 + Num_samples|N_or_S), data = cutoffs_bird_yukon)
+
+#calculate the AIC scores.
+#model2 is the best!
+AIC(model, model2, model3)
+
+#lets examine the outputs. No significance....
+summary(model2)
+ranef(model2)
+fixef(model2)
+
+#set the model of temperature vs. year with a random effect of location too
+temp_model <- lmer(formula = temperature ~ YearCollected + (1 + YearCollected|N_or_S), data=cutoffs_bird_yukon)
+
+#analyze the summary. There is significance!
+summary(temp_model)
+ranef(temp_model)
+fixef(temp_model)
+```
+
+##Plots
+
+Finally we will create two plots of our results. We will first need to predict the values from 'model2' and 'temp_model' from our data. Then we will plot the migration date vs temperature and temperature vs year, with groups of north/south in each.
+
+```{r}
+#predicting the model doesn't seem to like it being a grouped df, so lets change it
+cutoffs_bird_yukon <- as_data_frame(cutoffs_bird_yukon)
+
+#lets first predict the migration date vs. temperature values using model2, the best AIC score.
+predicted_values <- cutoffs_bird_yukon %>%
+  #filter for years without missing cutoff dates and temperatures
+  filter(!is.na(Cutoff) & temperature != "NaN") %>%
+  #create a new column using the predicted values.
+  mutate(fit.c = predict(model2, re.form = NULL))
+
+#now lets make the same thing for temperature
+predicted_values_temp <- cutoffs_bird_yukon %>%
+  filter(!is.na(Cutoff) & temperature != "NaN") %>%
+  mutate(fit.t= predict(temp_model, re.form = NULL))
+
+#next we can plot the two charts
+
+#plot of migration date vs. temperature
+predicted_values %>%
+  #make a ggplot of date vs. temperature
+  ggplot(aes(x=temperature, y = simple_date, colour = N_or_S)) +
+  #add points
+  geom_point() +
+  #add a geom_line of the predicted model
+geom_line(inherit.aes = F, aes(x = temperature, y = fit.c, colour = N_or_S), size = 1) +
+  #add labels
+  labs(title = "Median Migration Date vs. \nMigration Season Temperature (May-July)", x = "Migration Season Temperature", y = "Median Migration Julian Date", colour = "North or South") +
+  theme(plot.title = element_text(size = 16))
+
+#plot of temperature vs. year
+predicted_values_temp %>%
+  #make a ggplot of temperature vs. year
+  ggplot(aes(x=YearCollected, y = temperature, colour = N_or_S)) +
+  #add points
+  geom_point() +
+  #add a geom_line of the predicted model
+geom_line(inherit.aes = F, aes(x = YearCollected, y = fit.t, colour = N_or_S), size = 1) +
+  labs(title = "Migration Season Temperature\n(May - July) vs. Year", x = "Year", y = "Migration Season Temperature", colour = "North or South") +
+  theme(plot.title = element_text(size = 16))
+
+#plot of observation count vs year
+cutoffs_bird_yukon %>%
+  #make a ggplot of observation count vs year
+  ggplot(aes(x = YearCollected, y = Num_samples, colour = N_or_S)) +
+  geom_line()
+```
+
+
+
